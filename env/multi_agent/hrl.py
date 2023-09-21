@@ -5,6 +5,17 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 from ray.rllib.evaluation import episode_v2
+import pandas as pd
+from pympler import asizeof
+import tensorflow as tf
+import os
+from gymnasium import wrappers
+
+# Create directory if it doesn't exist
+os.makedirs("./tf_debug/hrl2", exist_ok=True)
+
+# Enable the debugger
+tf.debugging.experimental.enable_dump_debug_info("./tf_debug/hrl2")
 
 #! TODO
 #? 1) gather accumulated rewards from worker --> solely on trading revenue
@@ -12,16 +23,21 @@ from ray.rllib.evaluation import episode_v2
 
 class HRL(MultiAgentEnv):
  
-    def __init__(self, env_config, print_verbosity=1, initial_capital=2e6):
+    def __init__(self, env_config=None, print_verbosity=1, initial_capital=2e6):
         super(HRL, self).__init__()
         self.initial_capital = initial_capital
-        self.manager = Manager(env_config=env_config["manager_config"], initial_capital=initial_capital)
+        self.data = self.read_data()
+        # self.data = pd.read_pickle("/Users/floriankockler/Documents/GitHub.nosync/quantumai3/train1.pkl")
+        # self.manager = Manager(env_config=env_config["manager_config"], initial_capital=initial_capital)
+        self.manager = Manager(data=self.data, initial_capital=initial_capital)
         self._agent_ids = set(["manager"] + list(self.manager.workers.keys()))
         self.workers = self.manager.workers
         self.print_verbosity = print_verbosity
         self.episode = self.day = 0
-    
+        self.total_capital = initial_capital
         # Rewards
+        self.target_annualized_return = 0.15  # Example target annualized return of 15%
+        self.target_sharpe_ratio = 1.0   
 
 
         self.observation_space = gym.spaces.Dict({
@@ -36,6 +52,14 @@ class HRL(MultiAgentEnv):
             **{tic: worker.action_space for tic, worker in self.workers.items()}
         })
 
+    def read_data(self):
+        df = pd.read_pickle("/Users/floriankockler/Documents/GitHub.nosync/quantumai3/train1.pkl")
+        numerical_columns = df.select_dtypes(include=[np.number]).columns
+        for column in numerical_columns:
+            df[column] = df[column].astype(np.float32)
+        return df
+
+
     def reset(self, *, seed=None, options=None):
         manager_obs, manager_info = self.manager.reset()  # This will now only contain manager-specific states
         self.episode += 1
@@ -49,8 +73,23 @@ class HRL(MultiAgentEnv):
             worker_obs, worker_info = worker.reset()
             obs[worker_id] = worker_obs  # This should be a dictionary, as per your worker reset method
             info[worker_id] = worker_info
-            
+
+        # print("hrl",obs)
+
+      
+  
         return obs, info
+    
+    def check_nan_in_obs(self,obs, path=""):
+            if isinstance(obs, dict):
+                for key, value in obs.items():
+                    self.check_nan_in_obs(value, path + f".{key}")
+            elif isinstance(obs, (list, tuple, np.ndarray)):
+                for idx, value in enumerate(obs):
+                    self.check_nan_in_obs(value, path + f"[{idx}]")
+            else:
+                if np.isnan(obs).any():
+                    print(f"NaN value in hrl obs reset at step: {self.day}, path: {path}")
     
     def _reset_to_initial_values(self):
         self.day = 0
@@ -58,14 +97,12 @@ class HRL(MultiAgentEnv):
         self.manager_rewards_array = []
 
 
-    def _calculate_reward(self,worker_rewards, manager_reward):
-        
-        return 1
 
     def step(self, action_dict):
+        # print("HRL step being - self.day: ",self.day)
+
         fully_done = False
-        # print("action dict in hrl step: ",action_dict)
-        # manager_action = action_dict["manager"]
+
         
         obs = {"manager": None}  # We will update this later
         reward = {"manager": None}  # We will update this later
@@ -77,13 +114,14 @@ class HRL(MultiAgentEnv):
         worker_rewards = []
         worker_dones = []
         worker_truncateds = []
+       
     
         # Loop over all workers, apply actions, and gather results
         for worker_id, worker in self.workers.items():
             worker_action = action_dict[worker_id]
             worker_obs, worker_reward, worker_done, worker_truncated, worker_info = worker.step(worker_action)
             
-            worker_observations.append(worker_obs)
+            # worker_observations.append(worker_obs)
             worker_rewards.append(worker_reward)
             worker_dones.append(worker_done)
             worker_truncateds.append(worker_truncated)
@@ -94,16 +132,10 @@ class HRL(MultiAgentEnv):
             truncateds[worker_id] = worker_truncated
             info[worker_id] = worker_info
 
-        # Now call the manager's step method with the collected worker data
-        #! for tune run da wir keine managher action haben
-        manager_obs, manager_reward, manager_done, manager_truncated, manager_info = self.manager.step(None, worker_observations, worker_rewards, worker_dones, worker_truncateds)
-        #! das hatten wir vorher
-        # manager_obs, manager_reward, manager_done, manager_truncated, manager_info = self.manager.step(manager_action, worker_observations, worker_rewards, worker_dones, worker_truncateds)
-        # Get the manager's decisions
+  
+        manager_action = action_dict["manager"]
+        manager_obs, manager_reward, manager_done, manager_truncated, manager_info = self.manager.step(manager_action, worker_observations, worker_rewards, worker_dones, worker_truncateds)
 
-
-
-        
      
         terminateds["__all__"] = terminateds["__all__"] or worker_done
 
@@ -119,9 +151,27 @@ class HRL(MultiAgentEnv):
 
 
         self.day +=1
-  
-   
+
         return obs, reward, terminateds, truncateds, info
+
+
+
+    
+    def find_float64(self, obj, path=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                self.find_float64(value, path + f".{key}")
+        elif isinstance(obj, (list, tuple, np.ndarray)):
+            for idx, value in enumerate(obj):
+                self.find_float64(value, path + f"[{idx}]")
+        elif isinstance(obj, np.float64):
+            print(f"Found float64 at {path}")
+        else:
+            # This branch will handle single values and other data types
+            if isinstance(obj, float):
+                print(f"Found float (Python's native float type, which is typically float64) at {path}")
+            elif isinstance(obj, np.float64):
+                print(f"Found float32 at {path}")
         
     
     
@@ -133,24 +183,12 @@ class HRL(MultiAgentEnv):
             print(f"Total Cash Transfers: {self.manager.total_cash_transfers}")           
             print(f"total_portfolio_trades: {self.manager._calculate_total_portfolio_trades()[0]}")           
             print(f"Beginn_Portfolio_Value: {round(self.initial_capital)}")           
-            print(f"End_Portfolio_Value: {self.manager._get_state().get('total_portfolio_value')[0]}")
+            print(f"End_Portfolio_Value: {self.manager._calculate_total_portfolio_value()[0]}")
             print(f"Annual Return: {self.manager._calculate_annualized_return()*100:0.2f} %")
             for worker_id, worker in self.workers.items():
                 print(f"Worker ID: {worker_id} Current Stock Exposure: {round(worker._get_state().get('current_stock_exposure')[0])}")
-            print(f"Free Cash: {self.manager._get_state().get('total_free_cash')[0]}")
-            print(f"Total Costs: {self.manager._get_state().get('total_free_cash')[0]}")
+            print(f"Free Cash: {self.manager._calculate_free_cash()}")
+            print(f"Manager Common Pool: {self.manager.common_pool}")
             print("=================================")
 
 
-            # print(f"day: {self.day}, episode: {self.episode}")
-            # print(f"total_pnl: {self.total_pnl_history[-1]:0.2f}")
-            # print(f"self.cash_spent: {self.cash_spent:0.2f}")
-            # print(f"self.cash_from_sales: {self.cash_from_sales:0.2f}")
-            # print(f"total_cost: {self.total_costs:0.2f}")
-            # print(f"total_trades: {self.total_trades}")
-            # print(f"Begin_portfolio_value: {self.cash_initial }")
-            # print(f"End stock holdings: {self.stock_holding_memory[-1]}")
-            # print(f"Last stock price: {self.current_price}")
-            # print(f"End_portfolio_value: {self._calculate_assets()}")
-            # print(f"Invalid Actions {self.invalid_action_count}")
-            # print("=================================")

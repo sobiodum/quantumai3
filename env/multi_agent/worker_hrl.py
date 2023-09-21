@@ -4,7 +4,17 @@ import numpy as np
 from collections import deque
 import warnings
 import traceback
+from pympler import asizeof
 from env.multi_agent.worker_components.hrl_worker_performance import WorkerPerformanceStats
+import tensorflow as tf
+import os
+from gymnasium import wrappers
+
+# Create directory if it doesn't exist
+os.makedirs("./tf_debug/worker2", exist_ok=True)
+
+# Enable the debugger
+tf.debugging.experimental.enable_dump_debug_info("./tf_debug/worker2")
 
 #! CATCH EROR WITH the following
 # with warnings.catch_warnings():
@@ -22,13 +32,16 @@ class Spec(object):
 
 
 class Worker(gym.Env):
-    def __init__(self, env_config,trading_cost=0.001, initial_capital=1e6, initial_shares_held = 0,
+    def __init__(self, manager, worker_id, initial_capital, worker_allocation_pct,data,trading_cost=0.001, initial_shares_held = 0,
                  invalid_action_penalty=-0, print_verbosity=1, tic=None):
         super(Worker, self).__init__()
     
-        self.df = env_config["df"]
+        self.df = data
+        self.worker_id = worker_id
+        self.worker_allocation_pct = worker_allocation_pct
         self.tic = tic
         self.day = 0
+        self.manager = manager
         self.data = self.df.loc[self.day, :]
         self.trading_cost = trading_cost
         self.initial_shares_held = initial_shares_held
@@ -38,7 +51,6 @@ class Worker(gym.Env):
         #State Info
         self.cash_initial = np.float32(initial_capital)
         self.current_cash = np.float32(initial_capital)
-        # self.tech_indicator_list = env_config.get("tech_indicator_list")
         self.tech_indicator_list = [ 'avgvol_50',
        'sma_10', 'sma_50', 'sma_100', 'sma_200', 'wma_50', 'rsi_14',
        'volatility_30', 'volatility_100', 'stddev_30', 'dmi_14', 'adx_14',
@@ -70,7 +82,7 @@ class Worker(gym.Env):
         self.return_memory = [0]
 
         self.invalid_action_penalty = invalid_action_penalty
-        self.cash_adjustment = 0  # To track any cash adjustments made by the manager
+
         self.previous_portfolio_value = self._calculate_assets() 
 
         #Track position change
@@ -83,9 +95,11 @@ class Worker(gym.Env):
         self.previous_action_sign = 0  # To store the sign of the previous action
 
         #Manager Directives
-        self.capital_allocation = None
-        self.risk_limit = None
-        self.position_limit = None
+   
+
+        self.directives = {
+            "capital_allocation": self.worker_allocation_pct,
+        }
 
 
         #Debugging info
@@ -110,9 +124,10 @@ class Worker(gym.Env):
             'day': spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
             'tech_indicators': spaces.Box(low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32),
             'pnl': spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
-            'return_per_volatility': spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            # 'return_per_volatility': spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
             'total_trades': spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
             'current_stock_exposure': spaces.Box(low=-np.inf, high=np.inf, shape=(1,), dtype=np.float32),
+            'capital_allocation': spaces.Box(low=0, high=np.inf, shape=(1,), dtype=np.float32),
         
         })
 
@@ -128,9 +143,30 @@ class Worker(gym.Env):
 
     
     def set_directives(self, directives):
-        self.capital_allocation = directives["capital_allocation"]
-        self.risk_limit = directives["risk_limit"]
-        self.position_limit = directives["position_limit"]
+        for key, value in directives.items():
+            if key == "capital_allocation":
+                # Calculate the new cash allocation based on the directive and the total capital
+                # new_cash_allocation = value[0] * self.manager.common_pool
+                new_cash_allocation = value[0] 
+
+ 
+                change_in_value = new_cash_allocation - self.current_cash
+
+                new_cash_allocation = self.current_cash + change_in_value
+
+
+                # Notify the manager about the change in value
+                # self.manager.update_common_pool(self.worker_id, change_in_value)
+
+                # Update current cash
+                self.current_cash = new_cash_allocation
+                # if self.current_cash < 0:
+                #     print(f"worker_id: {self.worker_id} has {self.current_cash}")
+                # print("self.current_cash  - worker set directive",self.current_cash )
+
+  
+
+
 
     def decide_trade_action(self, manager_directives):
         # This method decides the trading action (buy, sell, hold) based on the worker's current state
@@ -152,6 +188,13 @@ class Worker(gym.Env):
         }
 
         return low_level_action
+    
+    def modify_action_based_on_directives(self, action):
+        # Modify the action based on the manager's directives
+        # ... (your logic here)
+
+        return action
+
 
     def decide_trade_type(self):
         # This method decides the trade type (hold, buy, or sell) based on the worker's current state
@@ -173,67 +216,78 @@ class Worker(gym.Env):
         # In a real implementation, you would use a more sophisticated method to decide the trade amount
         return np.random.uniform(0, 1)
     
-    def modify_action_based_on_decision(self, action, manager_decision):
-        # ... (logic to modify the action based on the manager's decision)
-        # For example, if the manager_decision indicates to reduce the position size, modify the action accordingly
-        return 0
 
-    def step(self, action, manager_decision=None):
-        done = self.day >= len(self.df.index.unique()) - 1
-        if done:
-            self._handle_done()
-        else:
-            self.current_step_cost = 0
-            if manager_decision:
-                # Modify the action based on the manager's decision
-                action = self.modify_action_based_on_decision(action, manager_decision)
-                # low_level_action = self.decide_trade_action(manager_directives)
-                # action_type = low_level_action['type']
-                # action_amount = low_level_action['amount']
 
-            begin_adj_portfolio_value = self._calculate_assets()
-            action_type = action['type']
-            action_amount = action['amount'][0]
-            
-    
-            if action_type == 0:  # hold
-                pass
-            elif action_type in [1, 2]:  # buy or sell
-                trade = self._handle_trading(action_type,action_amount)
-                self.actions_memory.append(action_amount)
-                self.trading_memory.append(trade)
-            self.action_type.append(action_type)
-            self.day += 1
-            self.data = self.df.loc[self.day, :]
-            self.state = self._get_state()
-  
-            end_adj_portfolio_value = self._calculate_assets()
-            portfolio_return = (end_adj_portfolio_value / begin_adj_portfolio_value) - 1
-            if isinstance(portfolio_return, np.ndarray) and portfolio_return.size == 1:
-                portfolio_return = portfolio_return.item()
-            self.return_memory.append(portfolio_return)
-            total_pnl = self._calculate_pnl()
-            self.total_pnl_history.append(total_pnl)
-            # Calculate the rolling 30 day portfolio volatility
-          
-            
-            
-            self.reward = self._calculate_reward(begin_adj_portfolio_value, end_adj_portfolio_value)
-        self.cash_adjustment = 0
+    def step(self, action):
+   
+        self.current_step_cost = 0
+        max_allowable_capital = self.directives["capital_allocation"] * self.manager.common_pool
+
+        begin_adj_portfolio_value = self._calculate_assets()
+        # print("begin_adj_portfolio_value", begin_adj_portfolio_value/1000000)
+
+        action_type = action['type']
+        action_amount = action['amount'][0]
+        
+
+        if action_type == 0:  # hold
+            pass
+        elif action_type in [1, 2]:  # buy or sell
+            trade = self._handle_trading(action_type,action_amount)
+            self.actions_memory.append(action_amount)
+            self.trading_memory.append(trade)
+
+        self.action_type.append(action_type)
+        self.day += 1
+        self.data = self.df.loc[self.day, :]
+        self.state = self._get_state()
+        end_adj_portfolio_value = self._calculate_assets()
+        # print("end_adj_portfolio_value", self._calculate_assets()/1000000)
+        portfolio_return = np.float32(0) if begin_adj_portfolio_value == 0 else np.float32((end_adj_portfolio_value / begin_adj_portfolio_value) - 1)
+        if isinstance(portfolio_return, np.ndarray) and portfolio_return.size == 1:
+            portfolio_return = portfolio_return.item()
+        self.return_memory.append(portfolio_return)
+        total_pnl = self._calculate_pnl()
+        self.total_pnl_history.append(total_pnl)
+        # Calculate the rolling 30 day portfolio volatility
+        
+        
+        
+        self.reward = self._calculate_reward(begin_adj_portfolio_value, end_adj_portfolio_value)
+ 
         self.trading_pentalty = 0
         self.current_step_cost = 0
         truncated = False
         info = {}
         obs = self._get_state()
- 
+        done = self.day >= len(self.df.index.unique()) - 1
+        # print("self.current_cash - step end",self.current_cash/1000000)
+        # print("self.shares_held step end",self.shares_held )
+      
         return obs, self.reward, done, truncated, info
+    
+   
+    def check_for_nan(self,obs, path=""):
+        if isinstance(obs, dict):
+            for key, value in obs.items():
+                self.check_for_nan(value, path + f".{key}")
+        elif isinstance(obs, (list, tuple, np.ndarray)):
+            for idx, value in enumerate(obs):
+                self.check_for_nan(value, path + f"[{idx}]")
+        else:
+            if np.isnan(obs).any():
+                print(f"NaN value in hrl obs reset at step: {self.day}, path: {path}")
     
     def _calculate_reward(self,begin_adj_portfolio_value, end_adj_portfolio_value):
         reward = 0
         pnl = end_adj_portfolio_value - begin_adj_portfolio_value - self.current_step_cost 
         if self.invalid_action_count > 0:
             reward += self.invalid_action_penalty
-        reward = 0.01 * pnl - self.trading_pentalty 
+        reward = 0.01 * pnl - self.trading_pentalty
+        if np.isnan(reward):
+            print("reward in worker is NaN")
+            reward = np.float32(0)
+        
         return np.float32(reward)
         
     
@@ -242,7 +296,7 @@ class Worker(gym.Env):
             return 0
 
         shares_to_sell = shares_to_buy = 0
-        
+
         if action_type == 2: #Selling
             if self.shares_held <= 0.0001:
                 self.trading_pentalty += 1
@@ -251,6 +305,7 @@ class Worker(gym.Env):
             action_nominal_value = self.current_price * self.shares_held * action_amount
             shares_to_sell = min(self.shares_held, int(action_nominal_value / self.current_price))
             sell_amount = self.current_price * shares_to_sell * (1 - self.trading_cost)
+            self.manager.update_common_pool(self.worker_id, -sell_amount)
             
             self.cash_from_sales += sell_amount
             self.current_cash += np.float32(sell_amount)
@@ -267,6 +322,7 @@ class Worker(gym.Env):
             self.cash_spent += buy_amount 
             self.current_cash -= np.float32(buy_amount)
             self.total_trades +=1
+            self.manager.update_common_pool(self.worker_id, buy_amount)
 
 
       
@@ -282,7 +338,31 @@ class Worker(gym.Env):
 
 
     def _calculate_assets(self):
-        return np.float32(self.current_cash + self.shares_held * self.current_price - self.cash_adjustment)
+        total_assets = np.float32(self.current_cash + self.shares_held * self.current_price)
+
+        # print("_calculate_assets individual worker - current.cash",self.current_cash /1000000)
+        # print("_calculate_assets individual worker - sharesxprice",(self.shares_held * self.current_price)/1000000)
+        # print("_calculate_assets individual TOTAL worker",total_assets/1000000)
+        return np.float32(self.current_cash + self.shares_held * self.current_price)
+    
+    def _calculate_return_mean(self):
+        """ Calculate the mean of all returns"""
+        returns = np.array(self.return_memory)
+        if returns.size == 0:
+            return np.float32(0.0)
+        mean_return = np.mean(returns)
+        return np.float32(mean_return)
+    
+    def _calculate_return_std(self):
+        """ Calculate the standard deviation of all returns"""
+        returns = np.array(self.return_memory)
+        if returns.size == 0:
+            return np.float32(0.0)
+        else:
+            return np.float32(np.std(returns))
+        
+        
+
     
 
     # def caclulate_metrics(self, begin_adj_portfolio_value, end_adj_portfolio_value):
@@ -297,6 +377,11 @@ class Worker(gym.Env):
         """Calculated accumulated pnl and appends to self.total_pnl_history """
         pnl = (self.cash_from_sales - self.cash_spent)  + self.current_price * self.shares_held
         return np.float32(pnl)
+    
+    def _calculate_stock_exposure(self):
+        """Calculated total stock holdings per worker """
+        stock_holdings = self.current_price * self.shares_held
+        return np.float32(stock_holdings)
      
     def _get_sharpe_ratio(self):
         """
@@ -313,25 +398,26 @@ class Worker(gym.Env):
 
         # Ensure that there are no non-finite values in the returns array
         if not np.all(np.isfinite(returns)):
-            return np.array([0.0], dtype=np.float32)
+            return np.float32(0.0)
 
         # Calculate the Sharpe ratio
         sharpe_ratio = ((np.mean(returns))  / (np.std(returns))) * np.sqrt(252) if np.std(returns) != 0 else 0.0
 
         # Check for non-finite values in the calculated Sharpe ratio
         if not np.isfinite(sharpe_ratio):
-            sharpe_ratio = 0.0
+            sharpe_ratio = np.float32(0.0)
 
-        return np.array([sharpe_ratio], dtype=np.float32)
+        return np.float32(sharpe_ratio)
     
     def _get_return_memory(self):
         """
         Access the return memory for the manager
         
         Returns:
-            np.ndarray: A numpy array containing all return
+            np.ndarray: A numpy array containing all returns
+            shorten to 400 obs to save memory
         """
-        return np.array([self.return_memory], dtype=np.float32)
+        return np.array([self.return_memory[-400:]], dtype=np.float32)
         
 
 
@@ -352,16 +438,14 @@ class Worker(gym.Env):
         self.episode += 1
         obs = self._get_state()
         info = {}
+
+
         return obs, info
+    
     
     def _get_state(self): 
         self.current_price = np.float32(self.data["close"])
-
-        # State representation
-        # Current cash, shares held, current price, technical indicators, PnL, and new components
         stock_data = self.data
-        # for tech in self.tech_indicator_list:
-        #     print(f"Value and shape of {tech}: {stock_data[tech]}, {np.shape(stock_data[tech])}")
         tech_indicators = [np.float32(stock_data[tech]) for tech in self.tech_indicator_list]
 
         state = {
@@ -372,14 +456,16 @@ class Worker(gym.Env):
             'day': np.array([self.day], dtype=np.float32),  # Current step in the episode
             'tech_indicators': np.array(tech_indicators, dtype=np.float32),
             'pnl': np.array([self._calculate_pnl()], dtype=np.float32),
-            'return_per_volatility': np.array([self.peformance_stats.return_per_volatility()], dtype=np.float32),
+            # 'return_per_volatility': np.array([self.peformance_stats.return_per_volatility()], dtype=np.float32),
             'total_trades': np.array([self.total_trades], dtype=np.float32),
-            'current_stock_exposure': np.array([self.current_price * self.shares_held], dtype=np.float32)
+            'current_stock_exposure': np.array([self.current_price * self.shares_held], dtype=np.float32),
+            'capital_allocation': np.array([self.directives["capital_allocation"]], dtype=np.float32)
         }
   
         return state
 
     def _reset_to_initial_values(self):
+
         self.shares_held = self.trading_cost_cumulated = self.reward = 0
         self.cash_spent = self.cash_from_sales = 0
         self.current_price = np.float32(self.df.iloc[self.day]['close'])
@@ -404,59 +490,36 @@ class Worker(gym.Env):
         self.action_type = []
         self.total_pnl_history
         self.current_cash = self.cash_initial
-        self.capital_allocation = None
-        self.risk_limit = None
-        self.position_limit = None
         self.return_memory = [0]
 
+
     #! Passing information to Manager
+
 
     def _manager_get_current_cash(self):
         return np.float32(self.current_cash)
     
  
-    def adjust_cash(self, cash_amount):
-        """Adjust the current cash balance by a specified amount."""
-        if isinstance(cash_amount, np.ndarray):
-            cash_amount = cash_amount.item()
-        
-        if isinstance(self.current_cash, np.ndarray):
-            self.current_cash = self.current_cash.item()
-        
-        self.current_cash += np.float32(cash_amount)
-        self.cash_adjustment += cash_amount
-    # def adjust_cash(self, cash_amount):
-    #     """Adjust the current cash balance by a specified amount."""
-    #     self.current_cash += np.float32(cash_amount)
-    #     self.cash_adjustment += cash_amount  # Record the adjustment
 
 
-    def _handle_done(self):
-        return
-        if self.episode % self.print_verbosity == 0:
+    def find_float64(self, obj, path=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                self.find_float64(value, path + f".{key}")
+        elif isinstance(obj, (list, tuple, np.ndarray)):
+            for idx, value in enumerate(obj):
+                self.find_float64(value, path + f"[{idx}]")
+        elif isinstance(obj, np.float64):
+            print(f"Found float64 at {path}")
+        else:
+            # This branch will handle single values and other data types
+            if isinstance(obj, float):
+                print(f"Found float (Python's native float type, which is typically float64) at {path}")
+            elif isinstance(obj, np.float64):
+                print(f"Found float32 at {path}")
+    
 
-            print(f"day: {self.day}, episode: {self.episode}")
-            print(f"total_pnl: {self.total_pnl_history[-1]:0.2f}")
-            print(f"self.cash_spent: {self.cash_spent:0.2f}")
-            print(f"self.cash_from_sales: {self.cash_from_sales:0.2f}")
-            print(f"total_cost: {self.total_costs:0.2f}")
-            print(f"total_trades: {self.total_trades}")
-            print(f"Begin_portfolio_value: {self.cash_initial }")
-            print(f"End stock holdings: {self.stock_holding_memory[-1]}")
-            print(f"Last stock price: {self.current_price}")
-            print(f"End_portfolio_value: {self._calculate_assets()}")
-            print(f"Invalid Actions {self.invalid_action_count}")
-            print("=================================")
-            # print(f"Sortino: {self._calculate_sortino_ratio():0.3f}")
-            # print(f"Max_drawdown: {self._calculate_drawdown():0.3f}%")
-            # print(f"Avg_pos_duration: {self._calculate_average_position_duration():0.3f}")
-            # print(f"Avg_pos_adjustment: {self._calculate_average_position_adjustment():0.3f}")
 
-            # print(f"begin_total_asset: {self.asset_memory[0]:0.2f}")
-            # print(f"end_total_asset: {end_total_asset:0.2f}")
-            # print(f"Total Profit(%): {total_profit:0.2f}")
-            # print(f"Total Loss(%): {total_loss:0.2f}")
-            # print(f"Action Distribution: BUY: {buys} SELL: {sells}  HOLD: {holds}")
 
 
 #Out for now only
